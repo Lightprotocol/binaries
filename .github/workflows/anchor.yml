@@ -1,0 +1,101 @@
+name: Publish a release
+
+on:
+  push:
+    tags:
+      - "anchor*"
+
+permissions:
+  contents: write
+
+env:
+  LLVM_VERSION: 17
+
+jobs:
+  release-linux:
+    name: Release
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            suffix: macos-arm64
+
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            suffix: linux-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            suffix: macos-amd64
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            suffix: linux-amd64
+    runs-on: ${{ matrix.os }}
+    outputs:
+      version: ${{ steps.extract_version.outputs.version }}
+    steps:
+      - name: Extract version from tag
+        id: extract_version
+        run: |
+          echo "version=$(echo ${GITHUB_REF#refs/tags/anchor-})" >> $GITHUB_OUTPUT
+
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          repository: coral-xyz/anchor
+          ref: ${{ steps.extract_version.outputs.version }}
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      # Why gcc-multilib? blake3 crate expects bits/wordsize.h header...
+      # Don't worry, glibc is not being linked here - just this one headers is
+      # enough to make blake3 happy.
+      - name: Install dependencies
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          set -euxo pipefail
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo -e deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-${{ env.LLVM_VERSION }} main | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt update
+          sudo apt -y install clang-${{ env.LLVM_VERSION }} gcc-multilib lld-${{ env.LLVM_VERSION }}
+          echo /usr/lib/llvm-${{ env.LLVM_VERSION }}/bin >> $GITHUB_PATH
+
+      - name: Install dependencies
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          set -euxo pipefail
+          brew install llvm
+          echo "$(brew --prefix llvm)/bin" >> $GITHUB_PATH
+
+      - uses: Swatinem/rust-cache@v1
+
+      - name: Install target toolchain
+        run: |
+          rustup target add ${{ matrix.target }}
+      
+      - name: Build
+        env:
+          CC: clang
+          RUSTFLAGS: -C linker=clang -C link-arg=-fuse-ld=lld -C link-arg=--target=${{ matrix.target }}
+        run: |
+          cargo build --package anchor-cli --release --target ${{ matrix.target }}
+
+      - name: Setup tmate session
+        if: ${{ failure() }}
+        uses: mxschmitt/action-tmate@v3
+
+      - name: Copy binary
+        run: |
+          cp target/${{ matrix.target }}/release/anchor anchor-${{ matrix.suffix }}
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          files: |
+            anchor-${{ matrix.suffix }}
