@@ -1,0 +1,195 @@
+name: Solana Platform tools
+
+on:
+  push:
+    tags:
+      - "platform-tools-solana*"
+  # todo remove
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+env:
+  LLVM_VERSION: 16
+
+jobs:
+  release:
+    name: release
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            exe-suffix:
+          # - target: aarch64-unknown-linux-gnu
+          #   os: ubuntu-20.04
+          #   exe-suffix:
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            exe-suffix:
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            exe-suffix:
+          # - target: x86_64-unknown-linux-gnu
+          #   os: ubuntu-20.04
+          #   exe-suffix:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            exe-suffix:
+    runs-on: ${{ matrix.os }}
+    outputs:
+      version: ${{ steps.extract_version.outputs.version }}
+    steps:
+      - name: Extract version from tag
+        id: extract_version
+        run: |
+          echo "version=$(echo ${GITHUB_REF#refs/tags/platform-tools-solana-})" >> $GITHUB_OUTPUT
+
+      - name: Install dependencies
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          set -euxo pipefail
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo -e deb http://apt.llvm.org/focal/ llvm-toolchain-focal-${{ env.LLVM_VERSION }} main | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt update
+          sudo apt -y install \
+            clang-${{ env.LLVM_VERSION }} \
+            cmake \
+            lld-${{ env.LLVM_VERSION }} \
+            ninja-build
+          echo /usr/lib/llvm-${{ env.LLVM_VERSION }}/bin >> $GITHUB_PATH
+
+      - name: Install dependencies
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          brew install cmake ninja
+
+      - name: Install musl
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo sed -i 's/^deb /deb [arch=amd64] /g' /etc/apt/sources.list
+          sudo tee -a /etc/apt/sources.list << EOF
+          deb [arch=arm64] http://ports.ubuntu.com/ jammy main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ jammy-security main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ jammy-updates main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ jammy-backports main restricted universe multiverse
+          EOF
+          sudo dpkg --add-architecture arm64
+          sudo apt update
+          sudo apt -y install musl-dev:arm64
+
+      - name: Install musl
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          sudo apt -y install musl-dev
+
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          path: binaries
+
+      - name: Checkout Rust code
+        uses: actions/checkout@v2
+        with:
+          path: rust
+          repository: solana-labs/rust
+          ref: solana-tools-${{ steps.extract_version.outputs.version }}
+
+      - name: Build Rust
+        run: |
+          cd rust
+          cp ../binaries/platform-tools-solana/config.toml .
+          ./x.py build --stage 1 --target ${{ matrix.target }},sbf-solana-solana
+
+      - name: Setup tmate session
+        if: ${{ failure() }}
+        uses: mxschmitt/action-tmate@v3
+
+      - name: Checkout Cargo code
+        uses: actions/checkout@v2
+        with:
+          path: cargo
+          repository: solana-labs/cargo
+          ref: solana-tools-${{ steps.extract_version.outputs.version }}
+
+      - name: Build Cargo
+        env:
+          OPENSSL_STATIC: 1
+        run: |
+          cd cargo
+          cargo build --release
+
+      - name: Create version.md
+        run: |
+          echo "$( cd rust && git rev-parse HEAD )  https://github.com/solana-labs/rust.git" >> version.md
+          echo "$( cd cargo && git rev-parse HEAD )  https://github.com/solana-labs/cargo.git" >> version.md
+
+      - name: Copy Rust build products
+        run: |
+          set -euxo pipefail
+          mkdir -p deploy/rust
+          cp version.md deploy/
+          cp -R "rust/build/${{ matrix.target }}/stage1/bin" deploy/rust/
+          cp -R "cargo/target/release/cargo${{ matrix.exe-suffix }}" deploy/rust/bin/
+          mkdir -p deploy/rust/lib/rustlib/
+          cp -R "rust/build/${{ matrix.target }}/stage1/lib/rustlib/${{ matrix.target }}" deploy/rust/lib/rustlib/
+          cp -R "rust/build/${{ matrix.target }}/stage1/lib/rustlib/sbf-solana-solana" deploy/rust/lib/rustlib/
+          find . -maxdepth 6 -type f -path "./rust/build/${{ matrix.target }}/stage1/lib/*" -exec cp {} deploy/rust/lib \;
+          mkdir -p deploy/rust/lib/rustlib/src/rust
+          cp "rust/build/${{ matrix.target }}/stage1/lib/rustlib/src/rust/Cargo.lock" deploy/rust/lib/rustlib/src/rust
+          cp -R "rust/build/${{ matrix.target }}/stage1/lib/rustlib/src/rust/library" deploy/rust/lib/rustlib/src/rust
+
+      - name: Copy LLVM build products
+        run: |
+          set -euxo pipefail
+          mkdir -p deploy/llvm/{bin,lib}
+          while IFS= read -r f
+          do
+              bin_file="rust/build/${{ matrix.target }}/llvm/build/bin/${f}${{ matrix.exe-suffix }}"
+              if [[ -f "$bin_file" ]] ; then
+                  cp -R "$bin_file" deploy/llvm/bin/
+              fi
+          done < <(cat <<EOF
+          clang
+          clang++
+          clang-cl
+          clang-cpp
+          clang-16
+          ld.lld
+          ld64.lld
+          llc
+          lld
+          lld-link
+          lldb
+          lldb-vscode
+          llvm-ar
+          llvm-objcopy
+          llvm-objdump
+          llvm-readelf
+          llvm-readobj
+          EOF
+                   )
+          cp -R "rust/build/${{ matrix.target }}/llvm/build/lib/clang" deploy/llvm/lib/
+          if [[ "${{ matrix.target }}" != "x86_64-pc-windows-msvc" ]] ; then
+              cp -R newlib_install/sbf-solana/lib/lib{c,m}.a deploy/llvm/lib/
+              cp -R newlib_install/sbf-solana/include deploy/llvm/
+              cp -R rust/src/llvm-project/lldb/scripts/solana/* deploy/llvm/bin/
+              cp -R rust/build/${{ matrix.target }}/llvm/lib/liblldb.* deploy/llvm/lib/
+              cp -R rust/build/${{ matrix.target }}/llvm/lib/python* deploy/llvm/lib/
+          fi
+
+      - name: Archive artifacts
+        run: |
+          tar -C deploy -jcf solana-platform-tools-${{ matrix.target }}.tar.bz2 .
+          rm -rf deploy
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          files: |
+            solana-platform-tools-${{ matrix.target }}.tar.bz2
