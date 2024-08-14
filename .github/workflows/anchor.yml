@@ -48,7 +48,7 @@ jobs:
       - name: Install Rust toolchain
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: stable
+          toolchain: 1.79
           override: true
 
       # Why gcc-multilib? blake3 crate expects bits/wordsize.h header...
@@ -83,10 +83,6 @@ jobs:
           RUSTFLAGS: -C linker=clang -C link-arg=-fuse-ld=lld -C link-arg=--target=${{ matrix.target }}
         run: |
           cargo build --package anchor-cli --release --target ${{ matrix.target }}
-
-      - name: Setup tmate session
-        if: ${{ failure() }}
-        uses: mxschmitt/action-tmate@v3
 
       - name: Copy binary
         run: |
